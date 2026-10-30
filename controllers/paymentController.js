@@ -1012,8 +1012,21 @@ export const registerFree = async (req, res) => {
             transaction = rpcTransaction;
             registrationNo = registrationNoForRpc;
             await invalidateDashboardsFor(userId, groups);
+        } else if (rpcError?.code === "P0001" && /ALREADY_REGISTERED/.test(rpcError.message || "")) {
+            // Lost a race with another request for the same player and category.
+            return res.status(400).json({
+                message: "You are already registered in this category.",
+                code: "ALREADY_REGISTERED",
+            });
         } else if (rpcError && (rpcError.code === "PGRST202" || rpcError.code === "42883")) {
-            // Function not installed yet.
+            // Function not installed yet. The two-step write below cannot be made
+            // atomic: a crash between its writes can leave a transactions row behind.
+            // Set REQUIRE_ATOMIC_FREE_REGISTRATION=true once the SQL is applied to
+            // refuse it, rather than silently falling back.
+            if (process.env.REQUIRE_ATOMIC_FREE_REGISTRATION === "true") {
+                console.error("register_free_entry() is not installed; refusing the non-atomic fallback.");
+                return res.status(503).json({ message: "Free registration is temporarily unavailable. Please try again later." });
+            }
             const { data: tx, error: txError } = await supabaseAdmin.from("transactions").insert(transactionPayload).select().maybeSingle();
             if (txError || !tx) throw txError || new Error("Tx Insert Failed");
             transaction = tx;
