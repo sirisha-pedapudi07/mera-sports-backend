@@ -116,18 +116,33 @@ const findExistingOrderRecord = async (orderId) => {
  * insert fails the transaction row is removed, so a retry re-attempts both.
  * Returns { transaction, registrationNo, rows }.
  */
-const insertRegistrationRows = async ({ transaction, userId, eventId, groups, rowFields }) => {
-    const registrationNo = `REG-${Date.now()}`;
-    const rows = groups.map((g) => ({
+const buildRegistrationRows = ({ registrationNo, transactionId, userId, eventId, groups, rowFields }) =>
+    groups.map((g) => ({
         event_id: eventId,
         player_id: userId,
         registration_no: registrationNo,
         categories: g.categories,
         amount_paid: g.fee,
-        transaction_id: transaction.id,
+        transaction_id: transactionId,
         team_id: g.teamId || null,
         ...rowFields,
     }));
+
+// The player's dashboard is cached for 15 minutes. Without this the person
+// who just paid — and every partner/team-mate they entered — keeps seeing
+// "No events found" until the TTL lapses, while the admin screen already
+// shows the registration.
+const invalidateDashboardsFor = async (userId, groups) => {
+    const teamIds = [...new Set(groups.map((g) => g.teamId).filter(Boolean))];
+    await Promise.allSettled([
+        invalidateDashboardForRegistration({ userId }),
+        ...teamIds.map((teamId) => invalidateDashboardForRegistration({ userId, teamId })),
+    ]);
+};
+
+const insertRegistrationRows = async ({ transaction, userId, eventId, groups, rowFields }) => {
+    const registrationNo = `REG-${Date.now()}`;
+    const rows = buildRegistrationRows({ registrationNo, transactionId: transaction.id, userId, eventId, groups, rowFields });
 
     const { error: regError } = await supabaseAdmin.from("event_registrations").insert(rows);
     if (regError) {
@@ -139,15 +154,7 @@ const insertRegistrationRows = async ({ transaction, userId, eventId, groups, ro
         throw regError;
     }
 
-    // The player's dashboard is cached for 15 minutes. Without this the person
-    // who just paid — and every partner/team-mate they entered — keeps seeing
-    // "No events found" until the TTL lapses, while the admin screen already
-    // shows the registration.
-    const teamIds = [...new Set(groups.map((g) => g.teamId).filter(Boolean))];
-    await Promise.allSettled([
-        invalidateDashboardForRegistration({ userId }),
-        ...teamIds.map((teamId) => invalidateDashboardForRegistration({ userId, teamId })),
-    ]);
+    await invalidateDashboardsFor(userId, groups);
 
     return { transaction, registrationNo, rows };
 };
@@ -954,7 +961,8 @@ export const registerFree = async (req, res) => {
         try {
             ({ fee, groups } = await validateRequestForUser(event, userId, req.body));
         } catch (eligErr) {
-            if (eligErr.statusCode === 400) return res.status(400).json(badRequestBody(eligErr));
+            // A known rule failure (400 today; any 4xx later) is the player's to fix, not a server error.
+            if (eligErr.statusCode >= 400 && eligErr.statusCode < 500) return res.status(eligErr.statusCode).json(badRequestBody(eligErr));
             throw eligErr;
         }
 
@@ -978,28 +986,42 @@ export const registerFree = async (req, res) => {
         // entry. The reference is unique per registration, so nothing keyed on
         // manual_transaction_id (a unique index, reports) can collide.
         const freeRef = `FREE_${crypto.randomUUID()}`;
-        const { data: transaction, error: txError } = await supabaseAdmin.from("transactions").insert({
+        const transactionPayload = {
             order_id: freeRef,
             manual_transaction_id: freeRef,
             payment_mode: "manual",
             amount: 0,
             currency: "INR",
             user_id: userId,
-        }).select().maybeSingle();
+        };
+        const rowFields = { manual_transaction_id: freeRef, document_url: documentUrl, status: "verified" };
 
-        if (txError || !transaction) throw txError || new Error("Tx Insert Failed");
-
-        const { registrationNo } = await insertRegistrationRows({
-            transaction,
-            userId,
-            eventId: resolvedEventId,
-            groups,
-            rowFields: {
-                manual_transaction_id: freeRef,
-                document_url: documentUrl,
-                status: "verified",
-            },
+        // Preferred: one database function writes the transaction and every
+        // registration row together, so a failure leaves nothing behind
+        // (scripts/add_register_free_entry_fn.sql). Until that is applied the
+        // function does not exist, and the two-step write below is used instead.
+        let transaction;
+        let registrationNo;
+        const registrationNoForRpc = `REG-${Date.now()}`;
+        const { data: rpcTransaction, error: rpcError } = await supabaseAdmin.rpc("register_free_entry", {
+            p_transaction: transactionPayload,
+            p_rows: buildRegistrationRows({ registrationNo: registrationNoForRpc, transactionId: null, userId, eventId: resolvedEventId, groups, rowFields }),
         });
+
+        if (!rpcError && rpcTransaction) {
+            transaction = rpcTransaction;
+            registrationNo = registrationNoForRpc;
+            await invalidateDashboardsFor(userId, groups);
+        } else if (rpcError && (rpcError.code === "PGRST202" || rpcError.code === "42883")) {
+            // Function not installed yet.
+            const { data: tx, error: txError } = await supabaseAdmin.from("transactions").insert(transactionPayload).select().maybeSingle();
+            if (txError || !tx) throw txError || new Error("Tx Insert Failed");
+            transaction = tx;
+            ({ registrationNo } = await insertRegistrationRows({ transaction, userId, eventId: resolvedEventId, groups, rowFields }));
+        } else {
+            // The function ran and failed: it rolled back, so nothing was written.
+            throw rpcError || new Error("Free registration failed");
+        }
 
         // The registration is already saved; a notification problem must not
         // turn it into an error response (the player would retry and hit "already registered").
