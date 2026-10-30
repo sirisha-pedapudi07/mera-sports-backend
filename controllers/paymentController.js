@@ -131,7 +131,11 @@ const insertRegistrationRows = async ({ transaction, userId, eventId, groups, ro
 
     const { error: regError } = await supabaseAdmin.from("event_registrations").insert(rows);
     if (regError) {
-        await supabaseAdmin.from("transactions").delete().eq("id", transaction.id);
+        const { error: cleanupError } = await supabaseAdmin.from("transactions").delete().eq("id", transaction.id);
+        if (cleanupError) {
+            // Without this the orphan stays in the payment reports with no trace of why.
+            console.error(`[insertRegistrationRows] orphaned transaction ${transaction.id} (${transaction.order_id}) could not be removed:`, cleanupError);
+        }
         throw regError;
     }
 
@@ -944,12 +948,18 @@ export const registerFree = async (req, res) => {
             });
         }
 
-        const documentUrl = await uploadBase64(document, "event-documents", "user-docs");
+        // The document is optional; a supplied one that fails to upload is an
+        // error, not a silently missing file.
+        let documentUrl = null;
+        if (document) {
+            documentUrl = await uploadBase64(document, "event-documents", "user-docs");
+            if (!documentUrl) return res.status(500).json({ message: "Failed to upload document" });
+        }
 
         // transactions.payment_mode is kept to the values already in use
         // ("manual" / "razorpay"); the FREE_ENTRY id marks this as a no-payment entry.
         const { data: transaction, error: txError } = await supabaseAdmin.from("transactions").insert({
-            order_id: `FREE_${Date.now()}`,
+            order_id: `FREE_${crypto.randomUUID()}`,
             manual_transaction_id: "FREE_ENTRY",
             payment_mode: "manual",
             amount: 0,
@@ -971,16 +981,22 @@ export const registerFree = async (req, res) => {
             },
         });
 
-        dispatchRegistrationSideEffects({
-            userId,
-            eventId: resolvedEventId,
-            registrationNo,
-            amount: 0,
-            groups,
-            paymentId: null,
-            paymentMode: "manual",
-            status: "Confirmed",
-        });
+        // The registration is already saved; a notification problem must not
+        // turn it into an error response (the player would retry and hit "already registered").
+        try {
+            dispatchRegistrationSideEffects({
+                userId,
+                eventId: resolvedEventId,
+                registrationNo,
+                amount: 0,
+                groups,
+                paymentId: null,
+                paymentMode: "manual",
+                status: "Confirmed",
+            });
+        } catch (sideEffectError) {
+            console.error("Free registration side effects failed:", sideEffectError);
+        }
 
         res.json({ success: true, message: "Registered", transactionId: transaction.id, registrationNo });
     } catch (err) {
