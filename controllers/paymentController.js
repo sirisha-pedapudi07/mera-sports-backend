@@ -913,6 +913,12 @@ export const submitManualPayment = async (req, res) => {
     }
 };
 
+// user+event pairs with a free registration in progress on this server. A
+// double-click or client retry arriving while the first request is still
+// validating / writing would otherwise pass the duplicate check too, as nothing
+// is saved yet. Per process only: a unique constraint is the cross-instance fix.
+const freeRegistrationsInFlight = new Set();
+
 // POST /api/payment/register-free
 // Registration for a selection that totals ₹0. No payment is taken and there is
 // nothing for an admin to verify, so the rows go in as `verified` straight away
@@ -920,6 +926,7 @@ export const submitManualPayment = async (req, res) => {
 // refuses any selection with a non-zero fee, so this can never be used to skip
 // paying for a paid category.
 export const registerFree = async (req, res) => {
+    let inFlightKey = null;
     try {
         const { eventId, document } = req.body;
         const userId = req.user?.id;
@@ -931,6 +938,16 @@ export const registerFree = async (req, res) => {
         const event = await resolveEventByIdentifier(eventId, "*");
         if (!event) return res.status(404).json({ message: "Event not found" });
         const resolvedEventId = event.id;
+
+        inFlightKey = `${userId}:${resolvedEventId}`;
+        if (freeRegistrationsInFlight.has(inFlightKey)) {
+            inFlightKey = null; // not ours to release
+            return res.status(409).json({
+                message: "Your registration is already being processed. Please wait a moment.",
+                code: "REGISTRATION_IN_PROGRESS",
+            });
+        }
+        freeRegistrationsInFlight.add(inFlightKey);
 
         let fee;
         let groups;
@@ -1008,6 +1025,8 @@ export const registerFree = async (req, res) => {
     } catch (err) {
         console.error("Free registration error:", err);
         res.status(500).json({ message: "Internal Server Error" });
+    } finally {
+        if (inFlightKey) freeRegistrationsInFlight.delete(inFlightKey);
     }
 };
 
