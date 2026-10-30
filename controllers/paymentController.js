@@ -909,6 +909,86 @@ export const submitManualPayment = async (req, res) => {
     }
 };
 
+// POST /api/payment/register-free
+// Registration for a selection that totals ₹0. No payment is taken and there is
+// nothing for an admin to verify, so the rows go in as `verified` straight away
+// (which also releases the receipt). Runs the same rules as the paid paths, and
+// refuses any selection with a non-zero fee, so this can never be used to skip
+// paying for a paid category.
+export const registerFree = async (req, res) => {
+    try {
+        const { eventId, document } = req.body;
+        const userId = req.user?.id;
+
+        if (!userId) return res.status(401).json({ message: "Unauthorized" });
+        if (!eventId || entriesFromRequest(req.body).length === 0) return res.status(400).json({ message: "Missing fields" });
+        if (isStaffRole(req.user.role)) return res.status(403).json({ message: "Admins cannot register." });
+
+        const event = await resolveEventByIdentifier(eventId, "*");
+        if (!event) return res.status(404).json({ message: "Event not found" });
+        const resolvedEventId = event.id;
+
+        let fee;
+        let groups;
+        try {
+            ({ fee, groups } = await validateRequestForUser(event, userId, req.body));
+        } catch (eligErr) {
+            if (eligErr.statusCode === 400) return res.status(400).json(badRequestBody(eligErr));
+            throw eligErr;
+        }
+
+        if (fee !== 0) {
+            return res.status(400).json({
+                message: "This selection is not free. Please pay to register.",
+                code: "PAYMENT_REQUIRED",
+            });
+        }
+
+        const documentUrl = await uploadBase64(document, "event-documents", "user-docs");
+
+        // transactions.payment_mode is kept to the values already in use
+        // ("manual" / "razorpay"); the FREE_ENTRY id marks this as a no-payment entry.
+        const { data: transaction, error: txError } = await supabaseAdmin.from("transactions").insert({
+            order_id: `FREE_${Date.now()}`,
+            manual_transaction_id: "FREE_ENTRY",
+            payment_mode: "manual",
+            amount: 0,
+            currency: "INR",
+            user_id: userId,
+        }).select().maybeSingle();
+
+        if (txError || !transaction) throw txError || new Error("Tx Insert Failed");
+
+        const { registrationNo } = await insertRegistrationRows({
+            transaction,
+            userId,
+            eventId: resolvedEventId,
+            groups,
+            rowFields: {
+                manual_transaction_id: "FREE_ENTRY",
+                document_url: documentUrl,
+                status: "verified",
+            },
+        });
+
+        dispatchRegistrationSideEffects({
+            userId,
+            eventId: resolvedEventId,
+            registrationNo,
+            amount: 0,
+            groups,
+            paymentId: null,
+            paymentMode: "manual",
+            status: "Confirmed",
+        });
+
+        res.json({ success: true, message: "Registered", transactionId: transaction.id, registrationNo });
+    } catch (err) {
+        console.error("Free registration error:", err);
+        res.status(500).json({ message: "Internal Server Error" });
+    }
+};
+
 /**
  * The caller's registration by number, merged across its rows. One payment
  * writes a row per Doubles/Team entry plus one for the singles, all under the
