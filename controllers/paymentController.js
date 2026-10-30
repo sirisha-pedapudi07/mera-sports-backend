@@ -433,7 +433,7 @@ export const createRazorpayOrder = async (req, res) => {
         // Razorpay rejects orders below ₹1, so a free (₹0) selection cannot go
         // through checkout. Fail here with a clear message rather than letting
         // the SDK throw something opaque. Free registration needs its own
-        // no-payment path — see FREE_ENTRY note in the admin CreateEvent form.
+        // no-payment path: registerFree below.
         if (!(fee > 0)) {
             return res.status(400).json({
                 message: "This selection totals ₹0. Free registration is not supported yet — contact the organiser.",
@@ -957,10 +957,13 @@ export const registerFree = async (req, res) => {
         }
 
         // transactions.payment_mode is kept to the values already in use
-        // ("manual" / "razorpay"); the FREE_ENTRY id marks this as a no-payment entry.
+        // ("manual" / "razorpay"); the FREE_ prefix marks this as a no-payment
+        // entry. The reference is unique per registration, so nothing keyed on
+        // manual_transaction_id (a unique index, reports) can collide.
+        const freeRef = `FREE_${crypto.randomUUID()}`;
         const { data: transaction, error: txError } = await supabaseAdmin.from("transactions").insert({
-            order_id: `FREE_${crypto.randomUUID()}`,
-            manual_transaction_id: "FREE_ENTRY",
+            order_id: freeRef,
+            manual_transaction_id: freeRef,
             payment_mode: "manual",
             amount: 0,
             currency: "INR",
@@ -975,7 +978,7 @@ export const registerFree = async (req, res) => {
             eventId: resolvedEventId,
             groups,
             rowFields: {
-                manual_transaction_id: "FREE_ENTRY",
+                manual_transaction_id: freeRef,
                 document_url: documentUrl,
                 status: "verified",
             },
@@ -983,6 +986,9 @@ export const registerFree = async (req, res) => {
 
         // The registration is already saved; a notification problem must not
         // turn it into an error response (the player would retry and hit "already registered").
+        // dispatchRegistrationSideEffects is not async: its email / WhatsApp work
+        // runs in an inner IIFE with its own try/catch, so nothing here can become
+        // an unhandled rejection. This catch covers only a synchronous throw.
         try {
             dispatchRegistrationSideEffects({
                 userId,
